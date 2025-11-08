@@ -1,0 +1,92 @@
+system:
+  max_cores: 12
+  max_disk_gb: 45
+  batch_size: 500
+  cleanup_after_upload: true
+
+paths:
+  base_data: "./data"
+  logs: "./logs"
+  temp: "./data/temp"
+
+aws:
+  region: "us-east-1"
+  s3:
+    bucket_name: "mandrake-data-dump"
+    final_prefix: "genomic_mining_data_dump/final/"
+    proteins_prefix: "genomic_mining_data_dump/proteins/"
+  rds:
+    # Fill in a full DSN, e.g.: postgresql://user:pass@host:5432/dbname
+    connection_string: "postgresql://postgres:mandrakebioinfo123#@mandrake-bioinfo-1.coli42qqmj0j.us-east-1.rds.amazonaws.com:5432/postgres"
+
+processing:
+  download_timeout: 180
+  max_retries: 3
+  min_valid_size_bytes: 1000
+  workers: 12
+  db_max_connections: 12
+  min_free_gb: 10
+
+sources:
+  order: [ "mgnify"]
+
+  ncbi:
+    enabled: true
+    kingdoms: [ "viral"]
+    limit: 100000
+    batch_size: 1000
+
+  ena:
+    enabled: true
+    kingdoms: [ "archaea", "viral"]
+    limit: 50000
+    batch_size: 300
+
+  sra:
+    enabled: true
+    limit: 10
+    batch_size: 25
+    # SRA downloads via NCBI Assembly database
+    # Focuses on WGS (Whole Genome Shotgun) projects
+
+  jgi_metagenome:
+    enabled: true
+    limit: 5
+    batch_size: 20
+    # Authentication cookies (refresh every ~30 days)
+    cookies:
+      jgi_session: "%2Fapi%2Fsessions%2Fd9c3393a342e50f7e946f9c83a4f5fa8"
+      _caliban_session: "SVUxZDlyWWMzbE45YkxTWEFMS2ZxbWlKMWhmZVNmaDhwTUVDdExaY3JoUmY3a3RNbWpmanJkejNQU2dyS21VZnQzeW9kK3JLRXBhS2xvZGdYSEx1a2pMZTBHNGtIWm1pUml2NTNXY0gzMjlVVVZJT2ZSWkZPa3gyOWY2TWFjdkFuVEVtbm1uV3h0SUV0SkZSRUhWYUpHM2s2L0srUjlCY1A1M3Yxa1hWRVhDb2JNbEJTV1ZXYXhrdWJZL0xMVjVFdWJvbGdEdWRJbWF2dU10anRycHZ1dGwxdUYzbVRPMXZBdjhPdEY1UzFPUUVZWG10T3FJazRGVG1KS3orb3psZ29MSGtwV3lrbWJYMVRzVzkwSVZxQzFZeVg4aVRZSmtYRXBjSU1VM0dEeHlmS1h0NXFXL0lHVHRJeG54VGd4WjAtLVZSektKaVlKdjhKRWsxd0xPeWtkV1E9PQ%3D%3D--216c5d94e6d6b6b132ffc0052990ac8299b54afe"
+
+  mgnify:
+    enabled: true
+    limit: 10000
+    batch_size: 100
+    analyses_per_study: 2
+    delay_seconds: 2.0
+    max_file_mb: 2000
+    environments:
+      - soil
+      - marine
+      - freshwater
+      - plant
+      - gut
+      - sediment
+      - wastewater
+      - biofilm
+      - hypersaline
+      - hot spring
+      - permafrost
+      - desert
+      - glacier
+      - rhizosphere
+      - estuary
+
+filtering:
+  genomes:
+    min_contig_length: 0
+  metagenomes:
+    min_contig_length: 0  # keep only contigs > 2000 bp
+
+dashboard:
+  port: 5000
