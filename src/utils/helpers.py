@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Helper utilities for file handling, validation, disk management, S3 uploads, and Prodigal"""
+"""Helper utilities - OPTIMIZED VERSION: Faster processing, no partial successes"""
 import gzip
 import shutil
 import hashlib
@@ -15,6 +15,7 @@ from Bio import SeqIO
 from botocore.config import Config
 from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import ClientError, EndpointConnectionError
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,7 @@ class S3Manager:
 
 
 # =========================
-# Prodigal & metagenome helpers
+# Prodigal & metagenome helpers - OPTIMIZED VERSION
 # =========================
 class ProdigalRunner:
     @staticmethod
@@ -319,53 +320,194 @@ class ProdigalRunner:
             return None
 
     @staticmethod
+    def _run_prodigal_on_split(split_path: Path):
+        """Worker function for parallel Prodigal execution"""
+        try:
+            return ProdigalRunner.predict_proteins(split_path, is_metagenome=True)
+        except Exception as e:
+            logger.error(f"Prodigal worker failed for {split_path.name}: {e}")
+            return None
+
+    @staticmethod
     def process_metagenome(fasta_path: Path, output_dir: Path):
-        """Process metagenome: split, run Prodigal on splits, merge results"""
+        """
+        OPTIMIZED metagenome processing:
+        1. Pre-filter short sequences (< 200bp - unlikely to have complete ORFs)
+        2. Use SIZE-based splitting for even distribution
+        3. Parallel Prodigal execution with ProcessPoolExecutor
+        4. FAIL FAST - no partial successes
+        5. Faster due to better parallelization
+        """
         output_dir.mkdir(parents=True, exist_ok=True)
         split_dir = output_dir / "splits"
         split_dir.mkdir(exist_ok=True)
         
         try:
-            # Split into chunks
-            subprocess.run(
-                ["seqkit", "split", "-p", "8", "-O", str(split_dir), str(fasta_path)],
-                check=True, 
-                timeout=600
-            )
+            # Step 1: Pre-filter and get statistics
+            logger.info(f"Pre-processing {fasta_path.name}...")
+            filtered_path = output_dir / f"{fasta_path.stem}_filtered.fasta"
             
-            split_files = list(split_dir.glob("*.fasta"))
-            if not split_files:
-                logger.warning(f"No split files created for {fasta_path}")
+            total_seqs = 0
+            total_bp = 0
+            kept_seqs = 0
+            kept_bp = 0
+            filtered_records = []
+            
+            MIN_CONTIG_LENGTH = 200  # Minimum length for potential ORFs
+            
+            for rec in SeqIO.parse(fasta_path, 'fasta'):
+                total_seqs += 1
+                total_bp += len(rec.seq)
+                if len(rec.seq) >= MIN_CONTIG_LENGTH:
+                    filtered_records.append(rec)
+                    kept_seqs += 1
+                    kept_bp += len(rec.seq)
+            
+            logger.info(f"Filtered: {kept_seqs}/{total_seqs} seqs ({kept_bp:,}/{total_bp:,} bp)")
+            
+            # Fail if insufficient data after filtering
+            if kept_seqs < 10:
+                logger.error(f"Too few sequences after filtering ({kept_seqs} seqs). Minimum: 10")
+                shutil.rmtree(split_dir, ignore_errors=True)
                 return None
             
-            # Run Prodigal on each split
+            if kept_bp < 50000:  # Less than 50kb total
+                logger.error(f"Insufficient bases after filtering ({kept_bp:,} bp). Minimum: 50kb")
+                shutil.rmtree(split_dir, ignore_errors=True)
+                return None
+            
+            # Write filtered sequences
+            SeqIO.write(filtered_records, filtered_path, 'fasta')
+            
+            # Step 2: Determine splitting strategy
+            # Small files: process directly without splitting
+            if kept_seqs < 1000 or kept_bp < 500000:  # < 1000 seqs or < 500kb
+                logger.info(f"Small metagenome, processing without splitting")
+                protein_path = ProdigalRunner.predict_proteins(filtered_path, is_metagenome=True)
+                shutil.rmtree(split_dir, ignore_errors=True)
+                if filtered_path.exists():
+                    filtered_path.unlink()
+                return protein_path
+            
+            # Step 3: Size-based splitting (ensures even distribution)
+            # Target: ~100kb per split, max 8 splits
+            target_size_kb = 100
+            num_splits = min(8, max(2, kept_bp // (target_size_kb * 1000)))
+            chunk_size_kb = kept_bp // (num_splits * 1000)
+            
+            logger.info(f"Splitting into {num_splits} chunks (~{chunk_size_kb}kb each)")
+            
+            # Use seqkit split by size (more even than by parts)
+            try:
+                subprocess.run(
+                    ["seqkit", "split2", "-s", f"{chunk_size_kb}k", "-O", str(split_dir), str(filtered_path)],
+                    check=True,
+                    capture_output=True,
+                    timeout=300
+                )
+            except subprocess.CalledProcessError:
+                # Fallback to split by parts if split2 not available
+                logger.warning("seqkit split2 failed, falling back to split by parts")
+                subprocess.run(
+                    ["seqkit", "split", "-p", str(num_splits), "-O", str(split_dir), str(filtered_path)],
+                    check=True,
+                    timeout=300
+                )
+            
+            split_files = sorted(split_dir.glob("*.fasta"))
+            if not split_files:
+                logger.error(f"No split files created for {fasta_path.name}")
+                shutil.rmtree(split_dir, ignore_errors=True)
+                if filtered_path.exists():
+                    filtered_path.unlink()
+                return None
+            
+            logger.info(f"Created {len(split_files)} split files")
+            
+            # Step 4: Validate all splits BEFORE running Prodigal
             for split_file in split_files:
-                ProdigalRunner.predict_proteins(split_file, is_metagenome=True)
+                split_seqs = sum(1 for _ in SeqIO.parse(split_file, 'fasta'))
+                split_bp = sum(len(r.seq) for r in SeqIO.parse(split_file, 'fasta'))
+                
+                if split_seqs < 10:
+                    logger.error(f"Split {split_file.name} too small: {split_seqs} seqs")
+                    shutil.rmtree(split_dir, ignore_errors=True)
+                    if filtered_path.exists():
+                        filtered_path.unlink()
+                    return None
+                
+                if split_bp < 10000:  # Less than 10kb
+                    logger.error(f"Split {split_file.name} insufficient data: {split_bp:,} bp")
+                    shutil.rmtree(split_dir, ignore_errors=True)
+                    if filtered_path.exists():
+                        filtered_path.unlink()
+                    return None
             
-            # Merge all protein predictions
+            # Step 5: Parallel Prodigal execution
+            logger.info(f"Running Prodigal on {len(split_files)} splits in parallel...")
+            
+            protein_files = []
+            with ProcessPoolExecutor(max_workers=min(8, len(split_files))) as executor:
+                future_to_split = {
+                    executor.submit(ProdigalRunner._run_prodigal_on_split, split_file): split_file 
+                    for split_file in split_files
+                }
+                
+                for future in as_completed(future_to_split):
+                    split_file = future_to_split[future]
+                    try:
+                        result = future.result()
+                        if result is None or not result.exists():
+                            # FAIL FAST - any failure means total failure
+                            logger.error(f"Prodigal failed on split {split_file.name}")
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            shutil.rmtree(split_dir, ignore_errors=True)
+                            if filtered_path.exists():
+                                filtered_path.unlink()
+                            return None
+                        protein_files.append(result)
+                    except Exception as e:
+                        logger.error(f"Exception processing {split_file.name}: {e}")
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        shutil.rmtree(split_dir, ignore_errors=True)
+                        if filtered_path.exists():
+                            filtered_path.unlink()
+                        return None
+            
+            # Step 6: Merge all proteins (all must succeed to reach here)
+            logger.info(f"Merging {len(protein_files)} protein files...")
             final_proteins = output_dir / f"{fasta_path.stem}_proteins.faa"
-            with open(final_proteins, "w") as outf:
-                for faa in split_dir.glob("*.faa"):
-                    with open(faa) as inf:
-                        outf.write(inf.read())
             
-            # Clean up split directory
+            with open(final_proteins, "w") as outf:
+                for faa in sorted(protein_files):
+                    if faa.suffix == '.gz':
+                        with gzip.open(faa, 'rt') as inf:
+                            outf.write(inf.read())
+                    else:
+                        with open(faa) as inf:
+                            outf.write(inf.read())
+            
+            # Step 7: Cleanup and compress
             shutil.rmtree(split_dir, ignore_errors=True)
+            if filtered_path.exists():
+                filtered_path.unlink()
             
             if not final_proteins.exists() or final_proteins.stat().st_size == 0:
+                logger.error(f"Merged protein file is empty")
                 return None
             
-            # Compress and delete original
+            logger.info(f"✓ Successfully processed all {len(protein_files)} splits")
+            
+            # Compress and return
             gz = FileValidator.ensure_gz(final_proteins)
             if gz:
                 return gz
             else:
-                logger.error(f"Metagenome protein compression failed for {final_proteins}")
+                logger.error(f"Protein compression failed")
                 return None
                 
         except Exception as e:
             logger.error(f"Metagenome processing failed for {fasta_path}: {e}")
-            # Clean up on error
             if split_dir.exists():
                 shutil.rmtree(split_dir, ignore_errors=True)
             return None

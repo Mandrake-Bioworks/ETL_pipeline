@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MGnify Extractor - ONLY processed genomic reads (FASTQ.fasta[.gz]) with rate limiting + origin metadata"""
+"""MGnify Extractor - OPTIMIZED with upfront DB filtering AND origin fix"""
 import time
 import json
 import gzip
@@ -12,15 +12,9 @@ logger = logging.getLogger(__name__)
 
 class MGnifyExtractor:
     """
-    Download ONLY processed genomic reads from MGnify analyses:
-      ✅ IDs that match *FASTQ.fasta or *FASTQ.fasta.gz
-      ❌ Skip predicted ORFs (.ffn), proteins (.faa), contigs/assembly .fasta
-
-    Config (optional):
-      sources.mgnify.environments:          list[str]  (default: ['soil','marine','freshwater','plant','gut','sediment'])
-      sources.mgnify.analyses_per_study:    int        (default: 2)
-      sources.mgnify.delay_seconds:         float      (default: 2.0)
-      sources.mgnify.max_file_mb:           int        (default: 2000)
+    Download ONLY processed genomic reads from MGnify analyses
+    OPTIMIZED: Checks database upfront to skip already-processed analyses
+    FIXED: Proper origin metadata tracking
     """
 
     BASE = "https://www.ebi.ac.uk/metagenomics/api/v1"
@@ -47,11 +41,47 @@ class MGnifyExtractor:
 
         # analysis_id -> {'origin': ...}
         self.metadata = {}
+        
+        # OPTIMIZATION: Load existing accessions at startup
+        self.existing_accessions = self._load_existing_accessions()
+        logger.info(f"MGnify: Found {len(self.existing_accessions)} existing accessions in database")
+
+    def _load_existing_accessions(self):
+        """Load all existing MGnify accessions from database"""
+        conn = self.db._getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT accession 
+                    FROM entries 
+                    WHERE source = 'mgnify'
+                """)
+                accessions = {row[0] for row in cur.fetchall()}
+                
+                # Also extract analysis IDs from accessions
+                # Accessions may be like "SRR123_FASTQ.fasta" or "MGYA00123456"
+                analysis_ids = set()
+                for acc in accessions:
+                    # If it starts with MGYA, it's an analysis ID
+                    if acc.startswith('MGYA'):
+                        analysis_ids.add(acc)
+                    # Otherwise extract from filename
+                    else:
+                        # Remove common suffixes
+                        clean = acc.replace('_FASTQ', '').replace('_MERGED_FASTQ', '')
+                        clean = clean.replace('.fasta', '').replace('.gz', '')
+                        analysis_ids.add(clean)
+                
+                return accessions | analysis_ids
+        finally:
+            self.db._putconn(conn)
 
     # ------------------- Public -------------------
 
     def download_batch(self, batch_size, seen_ids):
         downloaded = []
+        skipped_total = 0
+        
         for env in self.environments:
             if len(downloaded) >= batch_size:
                 break
@@ -59,6 +89,9 @@ class MGnifyExtractor:
             studies = self._search_studies(env, limit=max(batch_size, 10))
             if not studies:
                 continue
+
+            # Normalize environment to origin
+            normalized_origin = self._normalize_environment_to_origin(env)
 
             for study in studies:
                 if len(downloaded) >= batch_size:
@@ -71,26 +104,71 @@ class MGnifyExtractor:
                 if not analyses:
                     continue
 
-                study_origin = self._infer_origin_from_study(study)
+                # Use search environment as primary origin, with fallback
+                study_origin_fallback = self._infer_origin_from_study(study)
+                primary_origin = normalized_origin or study_origin_fallback
 
                 for analysis in analyses:
                     if len(downloaded) >= batch_size:
                         break
                     analysis_id = analysis.get('id')
-                    if not analysis_id or analysis_id in seen_ids or self.db.entry_exists(analysis_id):
+                    if not analysis_id:
+                        continue
+                    
+                    # OPTIMIZATION 1: Check database FIRST (in memory)
+                    if analysis_id in self.existing_accessions:
+                        skipped_total += 1
+                        continue
+                    
+                    # OPTIMIZATION 2: Check seen_ids (this session)
+                    if analysis_id in seen_ids:
+                        skipped_total += 1
+                        continue
+                    
+                    # OPTIMIZATION 3: Double-check database (runtime query)
+                    if self.db.entry_exists(analysis_id):
+                        skipped_total += 1
+                        self.existing_accessions.add(analysis_id)
                         continue
 
-                    path, origin = self._download_fastq_fasta_only(analysis_id, study_origin)
+                    # Try to infer from analysis, but use primary_origin as fallback
+                    analysis_origin = self._infer_origin_from_analysis(analysis_id)
+                    final_origin = analysis_origin or primary_origin
+
+                    path, _ = self._download_fastq_fasta_only(analysis_id, final_origin)
                     if path:
                         downloaded.append(path)
                         seen_ids.add(analysis_id)
-                        self.metadata[analysis_id] = {'origin': origin}
+                        
+                        # Store metadata with all possible keys
+                        self.metadata[analysis_id] = {'origin': final_origin}
+                        stem = path.stem.replace('.fasta', '').replace('.gz', '')
+                        self.metadata[stem] = {'origin': final_origin}
+                        
+                        logger.info(f"Downloaded {analysis_id} with origin: {final_origin}")
 
-        logger.info(f"MGnify: Downloaded {len(downloaded)} metagenomes")
+        logger.info(f"MGnify: Downloaded {len(downloaded)} new metagenomes, skipped {skipped_total} already in DB")
         return downloaded
 
     def get_metadata(self, accession_or_id: str):
-        return self.metadata.get(accession_or_id, {})
+        """Get metadata for an accession - try multiple key formats"""
+        # Try direct lookup
+        if accession_or_id in self.metadata:
+            return self.metadata[accession_or_id]
+        
+        # Try without extension
+        stem = accession_or_id.replace('.fasta', '').replace('.gz', '')
+        if stem in self.metadata:
+            return self.metadata[stem]
+        
+        # Try with _FASTQ, _MERGED_FASTQ suffixes removed
+        for suffix in ['_FASTQ', '_MERGED_FASTQ']:
+            if suffix in stem:
+                clean = stem.replace(suffix, '')
+                if clean in self.metadata:
+                    return self.metadata[clean]
+        
+        return {}
 
     # ------------------- Internals -------------------
 
@@ -129,7 +207,7 @@ class MGnifyExtractor:
         data = self._get_json(f"{self.BASE}/studies/{study_id}/analyses", params=params)
         return (data or {}).get('data', [])
 
-    def _download_fastq_fasta_only(self, analysis_id: str, study_origin: str | None):
+    def _download_fastq_fasta_only(self, analysis_id: str, origin: str | None):
         """
         Accept ONLY items matching *FASTQ.fasta or *FASTQ.fasta.gz (case-insensitive).
         Skip everything else (.ffn, .faa, contigs).
@@ -137,9 +215,7 @@ class MGnifyExtractor:
         dl = self._get_json(f"{self.BASE}/analyses/{analysis_id}/downloads")
         items = (dl or {}).get('data', [])
         if not items:
-            return None, study_origin
-
-        origin = self._infer_origin_from_analysis(analysis_id) or study_origin
+            return None, origin
 
         chosen = None
         for item in items:
@@ -156,7 +232,6 @@ class MGnifyExtractor:
                 break
 
         if not chosen:
-            # nothing acceptable for this analysis
             return None, origin
 
         url = (chosen.get('links') or {}).get('self')
@@ -174,7 +249,7 @@ class MGnifyExtractor:
             else:
                 filename += '.fasta'
 
-        out_dir = self.base_dir / filename  # separate namespace per file root to avoid collisions in temp
+        out_dir = self.base_dir / filename
         out_dir.mkdir(parents=True, exist_ok=True)
         dest = out_dir / filename
 
@@ -221,7 +296,7 @@ class MGnifyExtractor:
                         if chunk:
                             f.write(chunk)
 
-                # Detect if payload is gz; keep gz if so
+                # Detect if payload is gz
                 try:
                     with gzip.open(tmp, 'rb') as gzf:
                         _ = gzf.read(2)
@@ -241,7 +316,41 @@ class MGnifyExtractor:
 
     # ------------------- Origin inference -------------------
 
+    def _normalize_environment_to_origin(self, env_search_term: str) -> str | None:
+        """Map MGnify environment search terms to normalized origins"""
+        env = env_search_term.lower()
+        
+        if 'soil' in env or 'rhizosphere' in env:
+            return 'soil'
+        if 'marine' in env or 'ocean' in env or 'sea' in env:
+            return 'marine'
+        if 'freshwater' in env or 'lake' in env or 'river' in env:
+            return 'freshwater'
+        if 'plant' in env or 'leaf' in env or 'root' in env:
+            return 'plant'
+        if 'gut' in env or 'fecal' in env or 'intestin' in env:
+            return 'gut'
+        if 'sediment' in env or 'mud' in env:
+            return 'sediment'
+        if 'wastewater' in env or 'sewage' in env:
+            return 'wastewater'
+        if 'biofilm' in env:
+            return 'biofilm'
+        if 'hypersaline' in env or 'salt' in env:
+            return 'hypersaline'
+        if 'hot spring' in env or 'thermal' in env:
+            return 'hot spring'
+        if 'permafrost' in env or 'ice' in env or 'glacier' in env:
+            return 'permafrost'
+        if 'desert' in env or 'arid' in env:
+            return 'desert'
+        if 'estuary' in env:
+            return 'estuary'
+        
+        return None
+
     def _infer_origin_from_study(self, study_obj) -> str | None:
+        """Fallback: infer from study metadata text"""
         attrs = (study_obj or {}).get('attributes', {}) or {}
         text = " ".join([
             str(attrs.get('biome') or ''),
@@ -251,6 +360,7 @@ class MGnifyExtractor:
         return self._normalize_origin(text)
 
     def _infer_origin_from_analysis(self, analysis_id: str) -> str | None:
+        """Fallback: infer from analysis metadata text"""
         data = self._get_json(f"{self.BASE}/analyses/{analysis_id}")
         attrs = (data or {}).get('data', {}).get('attributes', {}) or {}
         text = " ".join([
@@ -264,13 +374,16 @@ class MGnifyExtractor:
 
     @staticmethod
     def _normalize_origin(text: str) -> str | None:
+        """Fallback normalization from free text"""
         if not text:
             return None
-        if any(k in text for k in ('soil',)):
+        if any(k in text for k in ('soil', 'rhizosphere')):
             return 'soil'
-        if any(k in text for k in ('marine', 'freshwater', 'water', 'ocean', 'sea', 'lake', 'river')):
-            return 'water'
-        if any(k in text for k in ('root', 'leaf', 'plant', 'rhizosphere')):
+        if any(k in text for k in ('marine', 'ocean', 'sea')):
+            return 'marine'
+        if any(k in text for k in ('freshwater', 'water', 'lake', 'river')):
+            return 'freshwater'
+        if any(k in text for k in ('root', 'leaf', 'plant')):
             return 'plant'
         if any(k in text for k in ('gut', 'fecal', 'feces', 'stool', 'intest')):
             return 'gut'
@@ -278,4 +391,6 @@ class MGnifyExtractor:
             return 'sediment'
         if any(k in text for k in ('skin', 'oral', 'mouth', 'saliva')):
             return 'host'
-        return 'Unknown'
+        if any(k in text for k in ('wastewater', 'sewage')):
+            return 'wastewater'
+        return None

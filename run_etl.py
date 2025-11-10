@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 FULL PARALLEL ETL with immediate cleanup after S3 upload
+FIXED: Continues through high-duplication regions instead of stopping early
 """
 import sys
 import yaml
@@ -84,10 +85,15 @@ class ETLPipeline:
         logging.info("\n✅ Pipeline Complete!")
 
     def _process_source(self, source, extractor):
+        """
+        Process a source with proper handling of high-duplication regions.
+        FIXED: No longer exits on first empty batch - continues through duplicates.
+        """
         batch_size = self.config['sources'][source]['batch_size']
         limit = self.config['sources'][source]['limit']
         total_processed = 0
         batch_num = 0
+        consecutive_empty = 0  # Track consecutive empty batches
         is_metagenome = (source == 'mgnify')
 
         while total_processed < limit:
@@ -103,8 +109,29 @@ class ETLPipeline:
 
             logging.info(f"\n--- Batch {batch_num}: Extracting {current_batch}... ---")
             files = extractor.download_batch(current_batch, self.seen_ids)
+            
+            # FIXED: Don't break immediately on empty batch
             if not files:
-                break
+                # Check if extractor reports all sources exhausted
+                if hasattr(extractor, 'search_exhausted'):
+                    if all(extractor.search_exhausted.values()):
+                        logging.info(f"{source.upper()}: All search sources exhausted")
+                        break
+                
+                # Allow multiple consecutive empty batches before giving up
+                # (High duplication can cause empty batches with unique data at higher offsets)
+                consecutive_empty += 1
+                max_empty = 5  # Allow 5 consecutive empty batches
+                
+                if consecutive_empty >= max_empty:
+                    logging.info(f"{source.upper()}: {max_empty} consecutive empty batches, stopping")
+                    break
+                
+                logging.info(f"{source.upper()}: Empty batch {consecutive_empty}/{max_empty}, trying next offset...")
+                continue  # Try next batch at higher offset
+            
+            # Reset consecutive empty counter on successful batch
+            consecutive_empty = 0
 
             logging.info(f"Extracted: {len(files)} files")
             processed_files = []
@@ -119,8 +146,11 @@ class ETLPipeline:
             logging.info(f"Processed: {len(processed_files)} files")
             # Note: files are now cleaned immediately after upload, but we still clean up any remnants
             self.disk.cleanup_files(processed_files)
-            if len(files) < current_batch:
-                break
+            
+            # REMOVED: Early exit on partial batch
+            # This was causing premature termination in high-duplication scenarios
+            # if len(files) < current_batch:
+            #     break
 
         logging.info(f"\n{source.upper()} Total: {total_processed} sequences processed")
 

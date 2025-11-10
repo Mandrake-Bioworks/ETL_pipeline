@@ -1,3 +1,58 @@
+# Temporary files
+*.swp
+*.swo
+*~
 *.backup
 *.bak
-backup/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.env
+
+# Data and logs
+data/
+temp/
+logs/
+*.log
+
+# Test and debug files
+debug.py
+test.*
+metadata.tsv
+rt_sequences.faa
+sequence.fasta
+
+# Configuration backups
+config.yaml
+config_test.yaml
+
+# Scripts not part of core ETL
+get_jgi_token.py
+jgi_helper.py
+reset_database.py
+run_pipeline.py
+setup.sh
+setup_new_sources.sh
+diagnose_dashboard.sh
+enhanced_dashboard.py
+test_flask.py
+
+# New source files not ready for main repo
+src/__init__.py
+src/database_manager.py
+src/extractors/__init__.py
+src/extractors/jgi_metagenome_extractor.py
+src/extractors/sra_extractor.py
+src/pipeline_controller.py
+src/processor.py
+src/processors/
+src/s3_uploader.py
+src/unified_downloader.py
+src/utils/__init__.py
